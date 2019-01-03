@@ -17,6 +17,16 @@
 #include <SoapySDR/Logger.hpp>
 %}
 
+
+// Declare a function that is called at the completion of each SWIG access.
+// This allows the Python API to have its own version of the registerLogHandler()
+// function available on the C API.
+// Logging traffic is queued and passed to a Python callback to route from all
+// the C SoapySDR code (regardless of which thread it runs in).
+%{
+static void checkLogMessages(void);
+%}
+
 ////////////////////////////////////////////////////////////////////////
 // http://www.swig.org/Doc2.0/Library.html#Library_stl_exceptions
 ////////////////////////////////////////////////////////////////////////
@@ -24,7 +34,10 @@
 
 %exception
 {
-    try{$action}
+    try{
+        $action;
+        checkLogMessages();  // call the registerLogHandler() callback as needed.
+    }
     catch (const std::exception &ex)
     {SWIG_exception(SWIG_RuntimeError, ex.what());}
     catch (...)
@@ -109,7 +122,7 @@
     %}
 };
 
-////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////
 // Constants SOAPY_SDR_*
 ////////////////////////////////////////////////////////////////////////
 %include <SoapySDR/Constants.h>
@@ -135,6 +148,11 @@
 %ignore SoapySDR::vlogf;
 %ignore SoapySDR::registerLogHandler;
 %include <SoapySDR/Logger.hpp>
+
+
+%inline  %{
+extern void registerLogHandler(PyObject *function);
+%}
 
 ////////////////////////////////////////////////////////////////////////
 // Device object
@@ -216,3 +234,89 @@ def extractBuffPointer(buff):
             return self.readStreamStatus__(stream, timeoutUs)
     %}
 };
+
+%{
+#include <mutex>
+#include <queue>
+
+#include <Python.h>
+
+template<class T>
+class ThreadSafeQueue {
+
+    std::queue<T> q;
+    std::mutex m;
+
+public:
+    void push(T elem) {
+        std::lock_guard<std::mutex> lock(m);
+        q.push(elem);
+    }
+
+    bool pop(T& elem) {
+        std::lock_guard<std::mutex> lock(m);
+        if (q.empty()) {
+            return false;
+        }
+        elem = q.front();
+        q.pop();
+        return true;
+    }
+};
+
+struct LogMessage {
+    SoapySDRLogLevel logLevel;
+    std::string message;
+};
+
+
+static ThreadSafeQueue<LogMessage> sLogQueue;
+
+
+static PyObject *python_callback;
+
+
+void checkLogMessages(void)
+{
+    if (!python_callback) {
+        return;
+    }
+    LogMessage logMessage;
+    while (sLogQueue.pop(logMessage)) {
+        PyObject* args = Py_BuildValue("(is)", logMessage.logLevel, logMessage.message.c_str());
+        PyObject* myResult = PyObject_CallObject(python_callback, args);
+        Py_XDECREF(args);
+        Py_XDECREF(myResult);
+    }
+}
+
+
+static void pythonLogHandler(const SoapySDRLogLevel logLevel, const char *message)
+{
+    if (!python_callback) {
+        return;
+    }
+    sLogQueue.push({logLevel, message});
+}
+
+
+// If passed None then remove python logging (it would be nice to restore default log handler in C API)
+//
+void registerLogHandler(PyObject *function)
+{
+    if (python_callback) {
+        Py_XDECREF(python_callback);
+    }
+
+    if (function == Py_None) {
+        python_callback = NULL;
+    } else if (PyCallable_Check(function)) {
+        python_callback = function;
+        Py_XINCREF(python_callback);
+        SoapySDR_registerLogHandler(pythonLogHandler);
+    } else {
+        python_callback = NULL;
+    }
+}
+
+%}
